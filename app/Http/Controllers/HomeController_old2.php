@@ -10,9 +10,6 @@ use Illuminate\Support\Facades\Storage;
 use PhpOffice\PhpWord\TemplateProcessor;
 use PhpOffice\PhpWord\IOFactory;
 use Barryvdh\DomPDF\Facade\Pdf;
-use Intervention\Image\ImageManager;
-use Intervention\Image\Drivers\Gd\Driver;
-use Intervention\Image\Format;
 
 class HomeController extends Controller
 {
@@ -43,22 +40,19 @@ class HomeController extends Controller
         //   hanya divalidasi format/tipe-nya jika memang diisi.
         // Template juga sudah pernah dimuat oleh getTemplate() di dalam
         // request ini, jadi kita pakai ulang supaya tidak query dua kali.
-        //
-        // $template, $uploadedImages, dan $tempDocxOutput dideklarasikan di
-        // luar try agar tetap bisa diakses oleh blok catch untuk logging &
-        // cleanup, termasuk jika kegagalan terjadi sangat awal (misalnya
-        // template terhapus tepat setelah validasi tapi sebelum baris ini).
-        $template = null;
-        $uploadedImages = [];
+        $template = $request->getTemplate() ?? Template::with('fields')->findOrFail($request->template_id);
+
+        // Path template asli
+        $templatePath = $this->resolveStoragePath($template->file_path);
+
+        $templateProcessor = new TemplateProcessor($templatePath);
+        $uploadedImages = []; // Penampung path gambar sementara untuk dihapus nanti
+
+        // tempDocxOutput dideklarasikan di luar try supaya tetap bisa
+        // diakses (untuk cleanup) walau terjadi exception sebelum di-assign.
         $tempDocxOutput = null;
 
         try {
-            $template = $request->getTemplate() ?? Template::with('fields')->findOrFail($request->template_id);
-
-            // Path template asli
-            $templatePath = $this->resolveStoragePath($template->file_path);
-
-            $templateProcessor = new TemplateProcessor($templatePath);
             // ===================================================================
             // TAHAP 1: Isi semua field (teks, gambar, signature) ke template.
             // Setiap field dicoba dengan SEMUA variasi penulisan tag yang mungkin
@@ -130,7 +124,7 @@ class HomeController extends Controller
             // konversi PDF), pastikan file gambar sementara tetap dibersihkan
             // supaya tidak menumpuk sebagai sampah di storage.
             Log::error('Gagal memproses export dokumen: ' . $e->getMessage(), [
-                'template_id' => $template?->id ?? $request->input('template_id'),
+                'template_id' => $template->id,
                 'exception' => $e,
             ]);
 
@@ -142,51 +136,8 @@ class HomeController extends Controller
                 @unlink($tempDocxOutput);
             }
 
-            // Kembalikan pesan yang bisa dipahami user, bukan stack trace mentah.
-            // buildUserFacingErrorMessage() menerjemahkan jenis exception teknis
-            // menjadi penjelasan "kenapa gagal" yang relevan untuk ditampilkan di UI.
-            return response()->json([
-                'success' => false,
-                'message' => $this->buildUserFacingErrorMessage($e),
-            ], 500);
+            throw $e;
         }
-    }
-
-    /**
-     * Menerjemahkan exception teknis menjadi pesan yang bisa dipahami user,
-     * tanpa membocorkan detail internal (path server, stack trace, dsb).
-     * Pesan ini ditampilkan langsung di UI saat proses export gagal.
-     */
-    private function buildUserFacingErrorMessage(\Throwable $e): string
-    {
-        // Template terhapus tepat setelah lolos validasi (race condition jarang terjadi)
-        if ($e instanceof \Illuminate\Database\Eloquent\ModelNotFoundException) {
-            return 'Template yang Anda pilih tidak lagi tersedia. Coba muat ulang halaman dan pilih template kembali.';
-        }
-
-        // Template .docx tidak ditemukan atau rusak/tidak bisa dibaca PhpWord
-        if ($e instanceof \PhpOffice\PhpWord\Exception\Exception) {
-            return 'Berkas template Word tidak dapat dibaca. Kemungkinan file template rusak atau formatnya tidak didukung. Coba unggah ulang template tersebut.';
-        }
-
-        // File template fisik tidak ada di storage
-        if (str_contains($e->getMessage(), 'is not readable') || str_contains($e->getMessage(), 'No such file')) {
-            return 'Berkas template tidak ditemukan di server. Kemungkinan template sudah dihapus atau dipindahkan. Coba pilih template lain atau unggah ulang.';
-        }
-
-        // Disk penuh saat menyimpan hasil
-        if (str_contains($e->getMessage(), 'disk full') || str_contains($e->getMessage(), 'No space left')) {
-            return 'Server kehabisan ruang simpan saat memproses dokumen. Hubungi administrator untuk membersihkan storage.';
-        }
-
-        // Kegagalan saat konversi ke PDF (Dompdf/IOFactory)
-        if (str_contains($e->getMessage(), 'Dompdf') || str_contains($e->getMessage(), 'IOFactory')) {
-            return 'Gagal mengonversi dokumen ke PDF. Coba ekspor sebagai DOCX, atau periksa kembali isian formulir (terutama gambar beresolusi sangat besar).';
-        }
-
-        // Fallback umum: tetap beri tahu user bahwa ini bukan kesalahan mereka,
-        // tanpa menyebut detail teknis internal yang tidak relevan bagi mereka.
-        return 'Terjadi kesalahan tak terduga saat memproses dokumen. Tim kami sudah mencatat detail errornya. Coba lagi beberapa saat, atau hubungi administrator jika masalah berlanjut.';
     }
 
     /**
@@ -222,6 +173,7 @@ class HomeController extends Controller
         array $searchTags
     ): array {
         $uploadedImages = [];
+
         $imageFiles = $request->file("fields.{$fieldName}");
         if (!is_array($imageFiles)) {
             $imageFiles = [$imageFiles];
@@ -229,61 +181,48 @@ class HomeController extends Controller
 
         $totalImages = count($imageFiles);
 
+        // Jika user mengunggah lebih dari 1 gambar, klon baris tabelnya di Word
+        // untuk setiap kemungkinan variasi tag.
         if ($totalImages > 1) {
             foreach ($searchTags as $tag) {
                 try {
                     $templateProcessor->cloneRow($tag, $totalImages);
                 } catch (\Exception $e) {
+                    Log::debug("cloneRow gagal untuk tag '{$tag}' (field: {$fieldName}): " . $e->getMessage());
                 }
             }
-        }
-
-        // Inisialisasi Image Manager versi 4
-        $manager = ImageManager::usingDriver(Driver::class);
-
-        $tempDir = storage_path('app/private/temp_images');
-        if (!file_exists($tempDir)) {
-            mkdir($tempDir, 0755, true);
         }
 
         foreach ($imageFiles as $index => $imageFile) {
-            if (!$imageFile->isValid()) continue;
+            if (!$imageFile->isValid()) {
+                continue;
+            }
 
-            $fileName = uniqid('img_') . '.jpg';
-            $tempRelativePath = 'temp_images/' . $fileName;
-            $fullImgPath = $tempDir . '/' . $fileName;
+            $tempPath = $imageFile->store('temp_images');
+            $fullImgPath = $this->resolveStoragePath($tempPath);
+            $uploadedImages[] = $tempPath;
 
-            try {
-                // Proses Kompresi Gambar v4
-                $image = $manager->decode($imageFile->getPathname());
+            $suffix = '#' . ($index + 1);
 
-                // Perkecil ukuran maksimal lebar 800px (tinggi proporsional otomatis)
-                $image->scaleDown(width: 800);
-
-                // Encode sebagai JPEG dengan kualitas 75, lalu simpan fisik
-                $encoded = $image->encodeUsingFormat(Format::JPEG, quality: 75);
-                $encoded->save($fullImgPath);
-
-                $uploadedImages[] = $tempRelativePath;
-
-                $suffix = '#' . ($index + 1);
-                foreach ($searchTags as $tag) {
-                    $targetTag = $totalImages > 1 ? $tag . $suffix : $tag;
-                    try {
-                        $templateProcessor->setImageValue($targetTag, [
-                            'path' => $fullImgPath,
-                            'width' => self::IMAGE_WIDTH,
-                            'height' => self::IMAGE_HEIGHT,
-                            'preserveAspectRatio' => true,
-                        ]);
-                    } catch (\Exception $e) {
-                    }
+            // Jika baris di-clone, PhpWord otomatis mengubah nama tag menjadi
+            // nama_tag#1, nama_tag#2, dst. Jika tidak di-clone (hanya 1 gambar),
+            // nama tag tetap nama_tag asli.
+            foreach ($searchTags as $tag) {
+                $targetTag = $totalImages > 1 ? $tag . $suffix : $tag;
+                try {
+                    $templateProcessor->setImageValue($targetTag, [
+                        'path' => $fullImgPath,
+                        'width' => self::IMAGE_WIDTH,
+                        'height' => self::IMAGE_HEIGHT,
+                        'preserveAspectRatio' => true,
+                    ]);
+                } catch (\Exception $e) {
+                    Log::debug("setImageValue gagal untuk tag '{$targetTag}' (field: {$fieldName}): " . $e->getMessage());
                 }
-            } catch (\Exception $e) {
-                Log::error("Gagal memproses/mengompres gambar pada field {$fieldName}: " . $e->getMessage());
             }
         }
 
+        // Bersihkan sisa tag gambar yang meleset (misalnya tag #2 tanpa gambar kedua)
         foreach ($searchTags as $tag) {
             $this->trySetValue($templateProcessor, $tag, '', $fieldName);
             $this->trySetValue($templateProcessor, $tag . '#2', '', $fieldName);
@@ -305,49 +244,27 @@ class HomeController extends Controller
         array $searchTags
     ): array {
         $uploadedImages = [];
-        $sigFile = $request->file("fields.{$fieldName}");
 
+        $sigFile = $request->file("fields.{$fieldName}");
         if (!$sigFile->isValid()) {
             return $uploadedImages;
         }
 
-        // Inisialisasi Image Manager versi 4
-        $manager = ImageManager::usingDriver(Driver::class);
-        $tempDir = storage_path('app/private/temp_images');
-        if (!file_exists($tempDir)) {
-            mkdir($tempDir, 0755, true);
-        }
+        $tempPath = $sigFile->store('temp_images');
+        $fullSigPath = $this->resolveStoragePath($tempPath);
+        $uploadedImages[] = $tempPath;
 
-        $fileName = uniqid('sig_') . '.png';
-        $tempRelativePath = 'temp_images/' . $fileName;
-        $fullSigPath = $tempDir . '/' . $fileName;
-
-        try {
-            // Proses Kompresi Tanda Tangan v4
-            $image = $manager->decode($sigFile->getPathname());
-
-            // Lebar maksimal 400px
-            $image->scaleDown(width: 400);
-
-            // Encode sebagai PNG dan simpan fisik
-            $encoded = $image->encodeUsingFormat(Format::PNG);
-            $encoded->save($fullSigPath);
-
-            $uploadedImages[] = $tempRelativePath;
-
-            foreach ($searchTags as $tag) {
-                try {
-                    $templateProcessor->setImageValue($tag, [
-                        'path' => $fullSigPath,
-                        'width' => self::SIGNATURE_WIDTH,
-                        'height' => self::SIGNATURE_HEIGHT,
-                        'preserveAspectRatio' => true,
-                    ]);
-                } catch (\Exception $e) {
-                }
+        foreach ($searchTags as $tag) {
+            try {
+                $templateProcessor->setImageValue($tag, [
+                    'path' => $fullSigPath,
+                    'width' => self::SIGNATURE_WIDTH,
+                    'height' => self::SIGNATURE_HEIGHT,
+                    'preserveAspectRatio' => true,
+                ]);
+            } catch (\Exception $e) {
+                Log::debug("setImageValue (signature) gagal untuk tag '{$tag}' (field: {$fieldName}): " . $e->getMessage());
             }
-        } catch (\Exception $e) {
-            Log::error("Gagal memproses tanda tangan pada field {$fieldName}: " . $e->getMessage());
         }
 
         return $uploadedImages;
@@ -355,8 +272,8 @@ class HomeController extends Controller
 
     /**
      * Menangani field bertipe teks (long_text & teks pendek biasa),
-     * termasuk pembersihan HTML dari rich text editor (Quill) dan
-     * konversi baris baru ke format yang dipahami Word.
+     * termasuk pembersihan HTML dari rich text editor (Quill), pemisahan list,
+     * dan konversi baris baru ke format yang dipahami Word.
      */
     private function handleTextField(
         TemplateProcessor $templateProcessor,
@@ -368,12 +285,40 @@ class HomeController extends Controller
         $value = $request->input("fields.{$fieldName}") ?? '';
 
         if ($field->field_type === 'long_text') {
-            // 1. Ubah tag HTML penutup Quill (paragraf/list item) menjadi baris baru
-            $cleanText = str_replace(['</p>', '</li>', '<br>', '<br/>'], ["\n", "\n", "\n", "\n"], $value);
-            // 2. Ubah tag pembuka list menjadi simbol poin asli (•)
-            $cleanText = str_replace(['<li>', '<ol>', '<ul>'], ["• ", "", ""], $cleanText);
-            // 3. Bersihkan sisa tag HTML lainnya dan decode entitas teksnya
-            $cleanText = html_entity_decode(strip_tags($cleanText));
+            // 1. Trik Regex Dinamis: Ordered List (Penomoran Angka)
+            // Menggunakan regex /is agar kebal terhadap class/attribute bawaan Quill (misal: <ol class="ql-list">)
+            $value = preg_replace_callback('/<ol[^>]*>(.*?)<\/ol>/is', function ($matches) {
+                $items = [];
+                preg_match_all('/<li[^>]*>(.*?)<\/li>/is', $matches[1], $liMatches);
+                foreach ($liMatches[1] as $index => $liText) {
+                    $items[] = ($index + 1) . '. ' . strip_tags($liText) . "\n";
+                }
+                return implode('', $items);
+            }, $value);
+
+            // 2. Trik Regex Dinamis: Unordered List (Bullet Points)
+            $value = preg_replace_callback('/<ul[^>]*>(.*?)<\/ul>/is', function ($matches) {
+                $items = [];
+                preg_match_all('/<li[^>]*>(.*?)<\/li>/is', $matches[1], $liMatches);
+                foreach ($liMatches[1] as $liText) {
+                    $items[] = '• ' . strip_tags($liText) . "\n";
+                }
+                return implode('', $items);
+            }, $value);
+
+            // 3. Fallback Ekstra: Jika Quill versi ini memuntahkan <li> tanpa dibungkus <ol>/<ul> sama sekali
+            $value = preg_replace_callback('/<li[^>]*>(.*?)<\/li>/is', function ($matches) {
+                return '• ' . strip_tags($matches[1]) . "\n";
+            }, $value);
+
+            // 4. Ubah sisa tag paragraf penutup </p> atau <br> menjadi baris baru (\n)
+            $cleanText = str_replace(['</p>', '<br>', '<br/>'], ["\n", "\n", "\n"], $value);
+
+            // 5. Buang sisa tag HTML & decode entitas (ENT_QUOTES menjaga tanda kutip tetap aman)
+            $cleanText = html_entity_decode(strip_tags($cleanText), ENT_QUOTES, 'UTF-8');
+
+            // 6. Bersihkan spasi atau enter berlebih di awal dan akhir dokumen
+            $cleanText = trim($cleanText);
 
             foreach ($searchTags as $tag) {
                 try {
