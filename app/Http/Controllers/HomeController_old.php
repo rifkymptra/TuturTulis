@@ -2,7 +2,6 @@
 
 namespace App\Http\Controllers;
 
-use App\Http\Requests\ExportDocumentRequest;
 use App\Models\Template;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Log;
@@ -32,15 +31,9 @@ class HomeController extends Controller
     }
 
     // Prosedur Inti: Proses data Form dan Ekspor Dokumen
-    public function export(ExportDocumentRequest $request)
+    public function export(Request $request)
     {
-        // ExportDocumentRequest sudah memvalidasi:
-        // - template_id wajib ada & valid
-        // - setiap "fields.*" bersifat NULLABLE (boleh dikosongkan user),
-        //   hanya divalidasi format/tipe-nya jika memang diisi.
-        // Template juga sudah pernah dimuat oleh getTemplate() di dalam
-        // request ini, jadi kita pakai ulang supaya tidak query dua kali.
-        $template = $request->getTemplate() ?? Template::with('fields')->findOrFail($request->template_id);
+        $template = Template::with('fields')->findOrFail($request->template_id);
 
         // Path template asli
         $templatePath = $this->resolveStoragePath($template->file_path);
@@ -48,95 +41,62 @@ class HomeController extends Controller
         $templateProcessor = new TemplateProcessor($templatePath);
         $uploadedImages = []; // Penampung path gambar sementara untuk dihapus nanti
 
-        // tempDocxOutput dideklarasikan di luar try supaya tetap bisa
-        // diakses (untuk cleanup) walau terjadi exception sebelum di-assign.
-        $tempDocxOutput = null;
+        // ===================================================================
+        // TAHAP 1: Isi semua field (teks, gambar, signature) ke template.
+        // Setiap field dicoba dengan SEMUA variasi penulisan tag yang mungkin
+        // dipakai di dokumen Word: nama_field, {nama_field}, ${nama_field},
+        // serta versi dengan spasi (nama field, {nama field}, ${nama field}).
+        // Ini menggabungkan jalur yang sebelumnya terpisah jadi dua loop
+        // berbeda menjadi satu loop, tanpa mengurangi variasi tag yang dicoba.
+        // ===================================================================
+        foreach ($template->fields as $field) {
+            $fieldName = $field->field_name;
+            $searchTags = $this->buildSearchTags($fieldName);
 
-        try {
-            // ===================================================================
-            // TAHAP 1: Isi semua field (teks, gambar, signature) ke template.
-            // Setiap field dicoba dengan SEMUA variasi penulisan tag yang mungkin
-            // dipakai di dokumen Word: nama_field, {nama_field}, ${nama_field},
-            // serta versi dengan spasi (nama field, {nama field}, ${nama field}).
-            // Ini menggabungkan jalur yang sebelumnya terpisah jadi dua loop
-            // berbeda menjadi satu loop, tanpa mengurangi variasi tag yang dicoba.
-            //
-            // Catatan: field yang dikosongkan user (tidak diupload / string kosong)
-            // tetap diproses seperti biasa — image/signature yang tidak ada filenya
-            // akan dilewati (lihat pengecekan hasFile di bawah), dan teks kosong
-            // akan disisipkan sebagai string kosong, sama seperti perilaku asli.
-            // ===================================================================
-            foreach ($template->fields as $field) {
-                $fieldName = $field->field_name;
-                $searchTags = $this->buildSearchTags($fieldName);
-
-                if ($field->field_type === 'image' && $request->hasFile("fields.{$fieldName}")) {
-                    $uploadedImages = array_merge(
-                        $uploadedImages,
-                        $this->handleImageField($templateProcessor, $request, $fieldName, $searchTags)
-                    );
-                } elseif ($field->field_type === 'signature' && $request->hasFile("fields.{$fieldName}")) {
-                    $uploadedImages = array_merge(
-                        $uploadedImages,
-                        $this->handleSignatureField($templateProcessor, $request, $fieldName, $searchTags)
-                    );
-                } else {
-                    $this->handleTextField($templateProcessor, $request, $field, $fieldName, $searchTags);
-                }
-            }
-
-            // ===================================================================
-            // TAHAP 2: Bersihkan kemungkinan placeholder yang "bocor" di dokumen,
-            // yaitu placeholder yang isinya kebetulan sama dengan value milik field
-            // lain. Perilaku ini dipertahankan persis seperti kode asli meskipun
-            // tampak tidak umum, karena ada kemungkinan template tertentu
-            // mengandalkannya.
-            // ===================================================================
-            foreach ($template->fields as $field) {
-                $fieldName = $field->field_name;
-                $userValue = $request->input("fields.{$fieldName}") ?? '';
-
-                if ($field->field_type !== 'image' && $field->field_type !== 'signature') {
-                    $this->trySetValue($templateProcessor, '${' . $userValue . '}', $userValue, $fieldName);
-                    $this->trySetValue($templateProcessor, '{' . $userValue . '}', $userValue, $fieldName);
-                }
-            }
-
-            // Simpan hasil pemrosesan .docx ke berkas sementara
-            $fileName = 'Hasil_' . time();
-            $tempDocxOutput = storage_path('app/' . $fileName . '.docx');
-            $templateProcessor->saveAs($tempDocxOutput);
-
-            // RESPONS BERDASARKAN FORMAT YANG DIPILIH USER
-            if ($request->submit_format == 'pdf') {
-                return $this->respondAsPdf($tempDocxOutput, $fileName, $uploadedImages);
+            if ($field->field_type === 'image' && $request->hasFile("fields.{$fieldName}")) {
+                $uploadedImages = array_merge(
+                    $uploadedImages,
+                    $this->handleImageField($templateProcessor, $request, $fieldName, $searchTags)
+                );
+            } elseif ($field->field_type === 'signature' && $request->hasFile("fields.{$fieldName}")) {
+                $uploadedImages = array_merge(
+                    $uploadedImages,
+                    $this->handleSignatureField($templateProcessor, $request, $fieldName, $searchTags)
+                );
             } else {
-                // Unduh langsung sebagai file .docx.
-                // Cleanup gambar dilakukan di sini secara eksplisit (bukan di finally)
-                // karena file .docx-nya sendiri TIDAK dihapus sebelum terkirim —
-                // deleteFileAfterSend(true) akan menghapusnya setelah response selesai.
-                $this->cleanupImages($uploadedImages);
-                return response()->download($tempDocxOutput)->deleteFileAfterSend(true);
+                $this->handleTextField($templateProcessor, $request, $field, $fieldName, $searchTags);
             }
-        } catch (\Throwable $e) {
-            // Apa pun yang gagal di luar try-catch internal (misalnya saveAs()
-            // gagal karena disk penuh, atau IOFactory::load() gagal saat
-            // konversi PDF), pastikan file gambar sementara tetap dibersihkan
-            // supaya tidak menumpuk sebagai sampah di storage.
-            Log::error('Gagal memproses export dokumen: ' . $e->getMessage(), [
-                'template_id' => $template->id,
-                'exception' => $e,
-            ]);
+        }
 
+        // ===================================================================
+        // TAHAP 2: Bersihkan kemungkinan placeholder yang "bocor" di dokumen,
+        // yaitu placeholder yang isinya kebetulan sama dengan value milik field
+        // lain. Perilaku ini dipertahankan persis seperti kode asli meskipun
+        // tampak tidak umum, karena ada kemungkinan template tertentu
+        // mengandalkannya.
+        // ===================================================================
+        foreach ($template->fields as $field) {
+            $fieldName = $field->field_name;
+            $userValue = $request->input("fields.{$fieldName}") ?? '';
+
+            if ($field->field_type !== 'image' && $field->field_type !== 'signature') {
+                $this->trySetValue($templateProcessor, '${' . $userValue . '}', $userValue, $fieldName);
+                $this->trySetValue($templateProcessor, '{' . $userValue . '}', $userValue, $fieldName);
+            }
+        }
+
+        // Simpan hasil pemrosesan .docx ke berkas sementara
+        $fileName = 'Hasil_' . time();
+        $tempDocxOutput = storage_path('app/' . $fileName . '.docx');
+        $templateProcessor->saveAs($tempDocxOutput);
+
+        // RESPONS BERDASARKAN FORMAT YANG DIPILIH USER
+        if ($request->submit_format == 'pdf') {
+            return $this->respondAsPdf($tempDocxOutput, $fileName, $uploadedImages);
+        } else {
+            // Unduh langsung sebagai file .docx
             $this->cleanupImages($uploadedImages);
-
-            // .docx sementara mungkin sudah terbentuk sebelum error terjadi
-            // (misalnya error terjadi saat konversi ke PDF) — bersihkan juga.
-            if ($tempDocxOutput !== null && file_exists($tempDocxOutput)) {
-                @unlink($tempDocxOutput);
-            }
-
-            throw $e;
+            return response()->download($tempDocxOutput)->deleteFileAfterSend(true);
         }
     }
 
@@ -272,8 +232,8 @@ class HomeController extends Controller
 
     /**
      * Menangani field bertipe teks (long_text & teks pendek biasa),
-     * termasuk pembersihan HTML dari rich text editor (Quill), pemisahan list,
-     * dan konversi baris baru ke format yang dipahami Word.
+     * termasuk pembersihan HTML dari rich text editor (Quill) dan
+     * konversi baris baru ke format yang dipahami Word.
      */
     private function handleTextField(
         TemplateProcessor $templateProcessor,
@@ -285,40 +245,12 @@ class HomeController extends Controller
         $value = $request->input("fields.{$fieldName}") ?? '';
 
         if ($field->field_type === 'long_text') {
-            // 1. Trik Regex Dinamis: Ordered List (Penomoran Angka)
-            // Menggunakan regex /is agar kebal terhadap class/attribute bawaan Quill (misal: <ol class="ql-list">)
-            $value = preg_replace_callback('/<ol[^>]*>(.*?)<\/ol>/is', function ($matches) {
-                $items = [];
-                preg_match_all('/<li[^>]*>(.*?)<\/li>/is', $matches[1], $liMatches);
-                foreach ($liMatches[1] as $index => $liText) {
-                    $items[] = ($index + 1) . '. ' . strip_tags($liText) . "\n";
-                }
-                return implode('', $items);
-            }, $value);
-
-            // 2. Trik Regex Dinamis: Unordered List (Bullet Points)
-            $value = preg_replace_callback('/<ul[^>]*>(.*?)<\/ul>/is', function ($matches) {
-                $items = [];
-                preg_match_all('/<li[^>]*>(.*?)<\/li>/is', $matches[1], $liMatches);
-                foreach ($liMatches[1] as $liText) {
-                    $items[] = '• ' . strip_tags($liText) . "\n";
-                }
-                return implode('', $items);
-            }, $value);
-
-            // 3. Fallback Ekstra: Jika Quill versi ini memuntahkan <li> tanpa dibungkus <ol>/<ul> sama sekali
-            $value = preg_replace_callback('/<li[^>]*>(.*?)<\/li>/is', function ($matches) {
-                return '• ' . strip_tags($matches[1]) . "\n";
-            }, $value);
-
-            // 4. Ubah sisa tag paragraf penutup </p> atau <br> menjadi baris baru (\n)
-            $cleanText = str_replace(['</p>', '<br>', '<br/>'], ["\n", "\n", "\n"], $value);
-
-            // 5. Buang sisa tag HTML & decode entitas (ENT_QUOTES menjaga tanda kutip tetap aman)
-            $cleanText = html_entity_decode(strip_tags($cleanText), ENT_QUOTES, 'UTF-8');
-
-            // 6. Bersihkan spasi atau enter berlebih di awal dan akhir dokumen
-            $cleanText = trim($cleanText);
+            // 1. Ubah tag HTML penutup Quill (paragraf/list item) menjadi baris baru
+            $cleanText = str_replace(['</p>', '</li>', '<br>', '<br/>'], ["\n", "\n", "\n", "\n"], $value);
+            // 2. Ubah tag pembuka list menjadi simbol poin asli (•)
+            $cleanText = str_replace(['<li>', '<ol>', '<ul>'], ["• ", "", ""], $cleanText);
+            // 3. Bersihkan sisa tag HTML lainnya dan decode entitas teksnya
+            $cleanText = html_entity_decode(strip_tags($cleanText));
 
             foreach ($searchTags as $tag) {
                 try {

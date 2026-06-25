@@ -61,7 +61,8 @@
                 <h3 class="text-lg font-bold text-gray-800 mb-6 border-b pb-3">Formulir Isian:
                     {{ $selectedTemplate->title }}</h3>
 
-                <form action="#" method="POST" enctype="multipart/form-data" onsubmit="syncQuillData()">
+                <form action="{{ route('home.export') }}" method="POST" enctype="multipart/form-data"
+                    onsubmit="syncQuillData()">
                     @csrf
                     <input type="hidden" name="template_id" value="{{ $selectedTemplate->id }}">
 
@@ -69,15 +70,22 @@
                         @foreach ($selectedTemplate->fields as $field)
                             <div>
                                 <label class="block text-sm font-medium text-gray-700 mb-2">
-                                    {{ $field->field_label ?? ucwords(str_replace('_', ' ', $field->field_name)) }}
+                                    @php
+                                        // Bersihkan karakter kurung kurawal atau dollar yang tersisa khusus untuk tampilan Label Form
+                                        $cleanLabel = str_replace(
+                                            ['{', '}', '$', '_'],
+                                            ['', '', '', ' '],
+                                            $field->field_label ?? $field->field_name,
+                                        );
+                                    @endphp
+                                    {{ ucwords($cleanLabel) }}
                                 </label>
 
                                 @if ($field->field_type == 'text')
                                     <div class="relative flex items-center">
                                         <input type="text" name="fields[{{ $field->field_name }}]"
                                             id="input-{{ $field->field_name }}"
-                                            class="w-full pl-4 pr-12 py-2.5 border border-gray-300 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                                            required>
+                                            class="w-full pl-4 pr-12 py-2.5 border border-gray-300 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none">
                                         <button type="button" id="btn-mic-input-{{ $field->field_name }}"
                                             onclick="toggleSpeechToText('input-{{ $field->field_name }}', 'input')"
                                             class="absolute right-3 bg-gray-100 hover:bg-gray-200 text-gray-600 p-2 rounded-xl transition">
@@ -102,19 +110,16 @@
                                     </div>
                                 @elseif($field->field_type == 'date')
                                     <input type="date" name="fields[{{ $field->field_name }}]"
-                                        class="w-full px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none"
-                                        required>
+                                        class="w-full px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 focus:outline-none">
                                 @elseif($field->field_type == 'image')
                                     <input type="file" name="fields[{{ $field->field_name }}][]" accept="image/*"
                                         class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
-                                        multiple required
-                                        onchange="previewImages(this, 'preview-{{ $field->field_name }}')">
+                                        multiple onchange="previewImages(this, 'preview-{{ $field->field_name }}')">
                                     <p class="text-xs text-gray-400 mt-1 mb-2">Bisa pilih beberapa gambar sekaligus.</p>
                                     <div id="preview-{{ $field->field_name }}" class="flex flex-wrap gap-2 mt-2"></div>
                                 @elseif($field->field_type == 'signature')
                                     <input type="file" name="fields[{{ $field->field_name }}]" accept="image/*"
                                         class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-sm file:font-semibold file:bg-amber-50 file:text-amber-700 hover:file:bg-amber-100"
-                                        required
                                         onchange="previewImages(this, 'preview-{{ $field->field_name }}', true)">
                                     <p class="text-xs text-gray-400 mt-1 mb-2">Hanya diperbolehkan 1 file tanda tangan.
                                     </p>
@@ -125,11 +130,11 @@
                     </div>
 
                     <div class="mt-8 pt-4 border-t flex gap-4">
-                        <button type="submit" name="format" value="docx"
+                        <button type="submit" name="submit_format" value="docx"
                             class="flex-1 bg-blue-600 text-white font-semibold py-3 px-4 rounded-xl hover:bg-blue-700 transition text-center text-sm">
                             Ekspor ke DOCX
                         </button>
-                        <button type="submit" name="format" value="pdf"
+                        <button type="submit" name="submit_format" value="pdf"
                             class="flex-1 bg-gray-800 text-white font-semibold py-3 px-4 rounded-xl hover:bg-gray-900 transition text-center text-sm">
                             Ekspor ke PDF
                         </button>

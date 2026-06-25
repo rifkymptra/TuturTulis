@@ -66,16 +66,27 @@ class TemplateController extends Controller
         }
 
         // 4. Daftarkan variabel ke tabel template_fields
+        // 4. Daftarkan variabel ke tabel template_fields (Pastikan nama BERSIH TOTAL)
         foreach ($variables as $variable) {
-            // Abaikan jika ada tag kosong atau aneh hasil pembersihan
-            if (trim($variable) == '' || str_contains($variable, '<')) continue;
+            // Sapu bersih semua karakter kurung kurawal, spasi, dan dollar dari nama variabel
+            $cleanFieldName = trim(str_replace(['{', '}', '$'], '', $variable));
 
-            TemplateField::create([
-                'template_id' => $template->id,
-                'field_name' => $variable,
-                'field_label' => ucwords(str_replace('_', ' ', $variable)),
-                'field_type' => 'text',
-            ]);
+            // Abaikan jika nama field kosong atau aneh setelah dibersihkan
+            if ($cleanFieldName == '' || str_contains($cleanFieldName, '<')) continue;
+
+            // Cek dulu apakah field_name yang bersih ini sudah terdaftar untuk template ini (biar tidak duplikat)
+            $exists = TemplateField::where('template_id', $template->id)
+                ->where('field_name', $cleanFieldName)
+                ->exists();
+
+            if (!$exists) {
+                TemplateField::create([
+                    'template_id' => $template->id,
+                    'field_name' => $cleanFieldName, // Tersimpan bersih: "sadsa"
+                    'field_label' => ucwords(str_replace('_', ' ', $cleanFieldName)),
+                    'field_type' => 'text',
+                ]);
+            }
         }
 
         return redirect()->route('admin.dashboard')->with('success', 'Template berhasil diunggah! Silakan sesuaikan tipe input fields di bawah jika diperlukan.');
